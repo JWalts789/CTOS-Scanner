@@ -64,7 +64,17 @@ body{position:fixed;inset:0}
 }
 #status .cell{display:flex;flex-direction:column;gap:3px}
 #status .cell .val{font-size:11px}
-#status .cell.push{margin-left:auto;text-align:right}
+#status .cell.push{margin-left:14px;text-align:right}
+#flip{
+  margin-left:auto;align-self:center;background:rgba(94,234,255,.06);
+  border:1px solid var(--grid);color:var(--signal);
+  font:600 9px/1 var(--sans);letter-spacing:.18em;text-transform:uppercase;
+  padding:8px 10px;touch-action:manipulation;
+}
+#flip:active{background:var(--signal);color:var(--void)}
+#cam.mirror{transform:scaleX(-1)}
+#modes button,#optbar button,#go,.x{touch-action:manipulation}
+#gain input{touch-action:none}
 .dot{width:5px;height:5px;border-radius:50%;background:var(--flag);display:inline-block;margin-right:5px;vertical-align:middle}
 .dot.ok{background:var(--signal);box-shadow:0 0 6px var(--signal)}
 
@@ -99,7 +109,7 @@ body{position:fixed;inset:0}
 /* ---- empty / error states ---- */
 .state{
   position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
-  width:min(320px,82%);text-align:center;
+  width:min(320px,82%);text-align:center;pointer-events:none;
 }
 .state h3{font-size:11px;letter-spacing:.22em;text-transform:uppercase;color:var(--signal);margin-bottom:8px;font-weight:600}
 .state p{font-size:12px;line-height:1.6;color:var(--dim)}
@@ -214,6 +224,7 @@ body{position:fixed;inset:0}
     <div class="cell"><span class="lbl">Fix</span><span class="val" id="sFix"><i class="dot"></i>—</span></div>
     <div class="cell"><span class="lbl">Hdg</span><span class="val" id="sHdg">---°</span></div>
     <div class="cell"><span class="lbl">Elev</span><span class="val" id="sElev">--°</span></div>
+    <button id="flip">Rear</button>
     <div class="cell push"><span class="lbl" id="sLbl">Contacts</span><span class="val" id="sCount">0</span></div>
   </header>
 
@@ -319,7 +330,7 @@ const HFOV = 52, VFOV = 68;
 
 const state = {
   mode:0, lat:null, lon:null, acc:null, alt:0,
-  heading:null, pitch:0,
+  heading:null, pitch:0, facing:'environment',
   aircraft:[], places:[], sim:false,
   lastAir:0, lastPlace:0, placeAnchor:null
 };
@@ -337,16 +348,37 @@ function dist(la1,lo1,la2,lo2){
   const a=Math.sin(dp/2)**2+Math.cos(p1)*Math.cos(p2)*Math.sin(dl/2)**2;
   return 2*R*Math.asin(Math.min(1,Math.sqrt(a)));
 }
-/* world bearing+elevation -> screen pixels, or null if behind us */
+/* The front camera looks the opposite way and its feed is mirrored like a
+   selfie, so the view heading rotates 180, pitch inverts, and x flips. */
+function viewHeading(){
+  if(state.heading==null) return null;
+  return state.facing==='user' ? (state.heading+180)%360 : state.heading;
+}
+function viewPitch(){ return state.facing==='user' ? -state.pitch : state.pitch; }
+
+/* world bearing+elevation -> screen pixels, or null if behind the camera */
 function project(brg,elev,w,h){
-  let db=((brg-(state.heading||0)+540)%360)-180;
+  const hd=viewHeading(); if(hd==null) return null;
+  let db=((brg-hd+540)%360)-180;
   if(Math.abs(db)>78) return null;
-  const de=elev-state.pitch;
+  const de=elev-viewPitch();
+  const mir = state.facing==='user' ? -1 : 1;
   return {
-    x: w/2 + (db/(HFOV/2))*(w/2),
+    x: w/2 + mir*(db/(HFOV/2))*(w/2),
     y: h/2 - (de/(VFOV/2))*(h/2),
     db, de
   };
+}
+
+/* nearest-first label thinning so dense areas don't stack into a wall */
+function declutter(cands,cap,dx,dy){
+  cands.sort((a,b)=>a.d-b.d);
+  const keep=[];
+  for(const c of cands){
+    if(keep.length>=cap) break;
+    if(keep.every(k=>Math.abs(k.x-c.x)>dx||Math.abs(k.y-c.y)>dy)) keep.push(c);
+  }
+  return keep;
 }
 
 /* ============================ CANVAS ============================ */
@@ -360,7 +392,7 @@ function fit(cv){
 }
 
 /* Signature element: the acquisition bracket. Every mode uses it. */
-function bracket(ctx,x,y,size,locked,label,sub){
+function bracket(ctx,x,y,size,locked,label,sub,cw){
   const s=size, arm=s*0.3, col=locked?'#ff8a3d':'#5eeaff';
   ctx.save();
   ctx.strokeStyle=col; ctx.lineWidth=1.5; ctx.globalAlpha=locked?1:.75;
@@ -375,20 +407,24 @@ function bracket(ctx,x,y,size,locked,label,sub){
   }
   ctx.shadowBlur=0;
   if(label){
-    /* leader line out to the right, then the data slug */
-    const lx=x+s+9, ly=y-s;
+    /* leader line to a data slug; flips to the left near the right edge */
+    const left = cw ? x > cw-150 : false;
+    const dir = left ? -1 : 1;
+    const lx=x+dir*(s+9), ly=y-s;
     ctx.globalAlpha=.5;
-    ctx.beginPath(); ctx.moveTo(x+s,y-s); ctx.lineTo(lx,ly); ctx.lineTo(lx+11,ly); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+dir*s,y-s); ctx.lineTo(lx,ly); ctx.lineTo(lx+dir*11,ly); ctx.stroke();
     ctx.globalAlpha=1;
     ctx.fillStyle=col;
     ctx.font='600 12px ui-monospace,SF Mono,Menlo,monospace';
     ctx.textBaseline='bottom';
-    ctx.fillText(label, lx+14, ly+4);
+    ctx.textAlign = left ? 'right' : 'left';
+    ctx.fillText(label, lx+dir*14, ly+4);
     if(sub){
       ctx.fillStyle='#5d7688';
       ctx.font='600 8px -apple-system,sans-serif';
-      ctx.fillText(sub.toUpperCase(), lx+14, ly+15);
+      ctx.fillText(sub.toUpperCase(), lx+dir*14, ly+15);
     }
+    ctx.textAlign='left';
   }
   ctx.restore();
 }
@@ -411,7 +447,7 @@ let skyHits=[];
 
 async function pullAircraft(){
   if(state.lat===null) return;
-  if(state.sim){ state.aircraft=simAir(); return; }
+  if(state.sim) return;   /* sim regenerates per-frame in drawSky */
   const urls=[
     `https://api.adsb.lol/v2/point/${state.lat.toFixed(4)}/${state.lon.toFixed(4)}/80`,
     `https://api.airplanes.live/v2/point/${state.lat.toFixed(4)}/${state.lon.toFixed(4)}/80`
@@ -460,29 +496,45 @@ function drawSky(){
   const w=skyC.clientWidth,h=skyC.clientHeight;
   ctx.clearRect(0,0,w,h);
   skyHits=[];
-  if(state.lat===null||state.heading===null) return;
+  if(state.lat===null){
+    setErr(skyState,'No position fix','Placing aircraft needs location access. Reload and allow location.');
+    return;
+  }
+  if(state.heading===null){
+    setErr(skyState,'Compass offline','Lock-on needs motion & orientation access. Reload the page and tap Allow on the motion prompt.');
+    return;
+  }
+  if(state.sim) state.aircraft=simAir();
 
   crosshair(ctx,w,h);
-  let vis=0;
+  const cands=[];
   for(const a of state.aircraft){
     const gd=dist(state.lat,state.lon,a.lat,a.lon);
     const b=bearing(state.lat,state.lon,a.lat,a.lon);
     const el=deg(Math.atan2(a.alt*0.3048-state.alt, gd));
     const p=project(b,el,w,h);
-    if(!p) continue;
-    if(p.x<-60||p.x>w+60||p.y<-60||p.y>h+60) continue;
-    vis++;
-    const near=Math.abs(p.x-w/2)<58&&Math.abs(p.y-h/2)<58;
-    const size=clamp(30-gd/9000,13,30);
-    bracket(ctx,p.x,p.y,size,near,a.call,
-      Math.round(a.alt).toLocaleString()+' ft · '+(gd/1852).toFixed(1)+' nm');
-    skyHits.push({x:p.x,y:p.y,r:size+16,data:a,gd,el});
+    if(!p||p.x<-60||p.x>w+60||p.y<-60||p.y>h+60) continue;
+    cands.push({x:p.x,y:p.y,d:gd,a,el});
+  }
+  const vis=cands.length;
+  const keep=declutter(cands,12,64,30);
+  for(let i=keep.length-1;i>=0;i--){          /* far first, near drawn on top */
+    const c=keep[i], a=c.a;
+    const near=Math.abs(c.x-w/2)<58&&Math.abs(c.y-h/2)<58;
+    const size=clamp(30-c.d/9000,13,30);
+    bracket(ctx,c.x,c.y,size,near,a.call,
+      Math.round(a.alt).toLocaleString()+' ft · '+(c.d/1852).toFixed(1)+' nm',w);
+    skyHits.push({x:c.x,y:c.y,r:size+18,data:a,gd:c.d,el:c.el});
   }
   drawRadar();
-  skyState.style.display = (state.aircraft.length&&vis) ? 'none' : '';
-  if(state.aircraft.length&&!vis)
+  if(!state.aircraft.length){
+    if(!skyState.className.includes('err'))
+      setErr(skyState,null,null,state.sim?'Simulation':'Acquiring',
+        'Waiting on the aircraft feed. Contacts within 80 nautical miles appear automatically.');
+  } else if(!vis){
     setErr(skyState,null,null,'Nothing in frame',
       state.aircraft.length+' contacts tracked. Use the radar to find them.');
+  } else skyState.style.display='none';
   put('#sCount', state.aircraft.length);
 }
 
@@ -500,7 +552,7 @@ function drawRadar(){
   for(const a of state.aircraft){
     const gd=dist(state.lat,state.lon,a.lat,a.lon);
     const rr=(gd/148000)*R; if(rr>R) continue;
-    const th=rad(bearing(state.lat,state.lon,a.lat,a.lon)-(state.heading||0)-90);
+    const th=rad(bearing(state.lat,state.lon,a.lat,a.lon)-(viewHeading()||0)-90);
     ctx.fillStyle='#5eeaff';
     ctx.beginPath(); ctx.arc(cx+Math.cos(th)*rr, cy+Math.sin(th)*rr, 2.2,0,7); ctx.fill();
   }
@@ -512,11 +564,14 @@ let gndHits=[];
 
 async function pullPlaces(){
   if(state.lat===null) return;
+  /* 'out body' keeps node coordinates; 'tags' verbosity silently drops them */
   const q=`[out:json][timeout:20];(`+
     `way["building"]["name"](around:250,${state.lat},${state.lon});`+
     `node["amenity"]["name"](around:250,${state.lat},${state.lon});`+
     `way["amenity"]["name"](around:250,${state.lat},${state.lon});`+
-    `);out center tags 80;`;
+    `node["shop"]["name"](around:250,${state.lat},${state.lon});`+
+    `way["shop"]["name"](around:250,${state.lat},${state.lon});`+
+    `);out center 80;`;
   const eps=['https://overpass-api.de/api/interpreter','https://overpass.kumi.systems/api/interpreter'];
   for(const ep of eps){
     try{
@@ -546,32 +601,51 @@ function drawGround(){
   const w=gndC.clientWidth,h=gndC.clientHeight;
   ctx.clearRect(0,0,w,h);
   gndHits=[];
-  if(state.lat===null||state.heading===null) return;
+  if(state.lat===null){
+    setErr(gndState,'No position fix','Tagging structures needs location access. Reload and allow location.');
+    return;
+  }
+  if(state.heading===null){
+    setErr(gndState,'Compass offline','Lock-on needs motion & orientation access. Reload the page and tap Allow on the motion prompt.');
+    return;
+  }
   crosshair(ctx,w,h);
 
   /* horizon line grounds the whole overlay */
-  const hy=h/2+(state.pitch/(VFOV/2))*(h/2);
+  const hy=h/2+(viewPitch()/(VFOV/2))*(h/2);
   if(hy>-40&&hy<h+40){
     ctx.save(); ctx.strokeStyle='rgba(94,234,255,.16)'; ctx.setLineDash([5,7]);
     ctx.beginPath(); ctx.moveTo(0,hy); ctx.lineTo(w,hy); ctx.stroke(); ctx.restore();
   }
 
-  const list=state.places.map(p=>({p,d:dist(state.lat,state.lon,p.lat,p.lon)}))
-    .sort((a,b)=>b.d-a.d);
-  let vis=0;
-  for(const {p,d} of list){
+  const cands=[];
+  for(const p of state.places){
+    const d=dist(state.lat,state.lon,p.lat,p.lon);
     const b=bearing(state.lat,state.lon,p.lat,p.lon);
-    const pr=project(b,-2,w,h);
+    /* eye-height perspective: near things sit lower, far things hug the horizon */
+    const elevB=-deg(Math.atan2(1.7, Math.max(d,4)));
+    const pr=project(b,elevB,w,h);
     if(!pr||pr.x<-70||pr.x>w+70) continue;
-    vis++;
-    const near=Math.abs(pr.x-w/2)<58;
-    const size=clamp(34-d/9,15,34);
-    bracket(ctx,pr.x,pr.y,size,near,p.name.slice(0,20),p.kind.replace(/_/g,' ')+' · '+Math.round(d)+' m');
-    gndHits.push({x:pr.x,y:pr.y,r:size+16,data:p,d});
+    cands.push({x:pr.x,y:pr.y,d,p});
   }
-  gndState.style.display=(state.places.length&&vis)?'none':'';
-  if(state.places.length&&!vis)
-    setErr(gndState,null,null,'Nothing in frame',state.places.length+' structures indexed nearby. Sweep left or right.');
+  const vis=cands.length;
+  const keep=declutter(cands,8,96,34);
+  for(let i=keep.length-1;i>=0;i--){
+    const c=keep[i], p=c.p;
+    const near=Math.abs(c.x-w/2)<58;
+    const size=clamp(34-c.d/9,15,34);
+    bracket(ctx,c.x,c.y,size,near,p.name.slice(0,20),
+      p.kind.replace(/_/g,' ')+' · '+Math.round(c.d)+' m',w);
+    gndHits.push({x:c.x,y:c.y,r:size+18,data:p,d:c.d});
+  }
+  if(!state.places.length){
+    if(!gndState.className.includes('err'))
+      setErr(gndState,null,null,'Surveying',
+        'Sweep the phone across the street. Named structures within 250 metres are tagged.');
+  } else if(!vis){
+    setErr(gndState,null,null,'Nothing in frame',
+      state.places.length+' structures indexed nearby. Sweep left or right.');
+  } else gndState.style.display='none';
   if(state.mode===1) put('#sCount', state.places.length);
 }
 
@@ -590,18 +664,45 @@ function put(sel,v){ const e=$(sel); v=String(v); if(e._v!==v){ e._v=v; e.textCo
 let audioCtx=null, analyser=null, freqData=null, wfCtx=null, binHz=0;
 const F_LO=14000, F_HI=24000;
 
-async function startAudio(){
-  const s=await navigator.mediaDevices.getUserMedia({audio:{
-    echoCancellation:false, noiseSuppression:false, autoGainControl:false
-  }});
+let camStream=null, micReady=false;
+const AUDIO_C={echoCancellation:false, noiseSuppression:false, autoGainControl:false};
+const REAR_C={facingMode:{ideal:'environment'},width:{ideal:1280},height:{ideal:720}};
+
+async function initAV(){
+  /* one combined request: a single iOS prompt, and it sidesteps the Safari
+     quirk where a second getUserMedia can stall the stream from the first */
+  const s=await navigator.mediaDevices.getUserMedia({video:REAR_C, audio:AUDIO_C});
+  camStream=new MediaStream(s.getVideoTracks());
+  cam.srcObject=camStream; await cam.play();
+  try{ await initMic(new MediaStream(s.getAudioTracks())); }
+  catch(e){ micReady=false; }
+}
+async function initMic(stream){
+  if(!stream) stream=await navigator.mediaDevices.getUserMedia({audio:AUDIO_C});
   audioCtx=new (window.AudioContext||window.webkitAudioContext)();
-  const src=audioCtx.createMediaStreamSource(s);
+  const src=audioCtx.createMediaStreamSource(stream);
   analyser=audioCtx.createAnalyser();
   analyser.fftSize=8192; analyser.smoothingTimeConstant=0.55;
   src.connect(analyser);
   if(audioCtx.state==='suspended') await audioCtx.resume();
   freqData=new Uint8Array(analyser.frequencyBinCount);
   binHz=audioCtx.sampleRate/analyser.fftSize;
+  micReady=true;
+}
+async function flipCamera(){
+  const next = state.facing==='user' ? 'environment' : 'user';
+  const s=await navigator.mediaDevices.getUserMedia({
+    video: next==='user'
+      ? {facingMode:'user',width:{ideal:1280},height:{ideal:720}}
+      : REAR_C
+  });
+  if(camStream) camStream.getTracks().forEach(t=>t.stop());
+  camStream=s; cam.srcObject=s; await cam.play();
+  state.facing=next;
+  cam.classList.toggle('mirror', next==='user');
+  avgBuf=null;                 /* pulse's running average is per-scene */
+  state.placeAnchor=null;      /* fresh structure sweep for the new view */
+  put('#flip', next==='user' ? 'Front' : 'Rear');
 }
 
 function drawSignal(){
@@ -726,7 +827,10 @@ function drawOptics(){
   }
   workCtx.putImageData(img,0,0);
   fxCtx.imageSmoothingEnabled=true;
-  fxCtx.drawImage(work,0,0,W,H);
+  if(state.facing==='user'){
+    fxCtx.save(); fxCtx.translate(W,0); fxCtx.scale(-1,1);
+    fxCtx.drawImage(work,0,0,W,H); fxCtx.restore();
+  } else fxCtx.drawImage(work,0,0,W,H);
 }
 
 /* ============================ DETAIL SHEET ============================ */
@@ -784,8 +888,14 @@ gndC.addEventListener('click',e=>{
 function onOrient(e){
   let hd = e.webkitCompassHeading;
   if(hd==null && e.absolute && e.alpha!=null) hd=(360-e.alpha)%360;
-  if(hd!=null) state.heading = state.heading==null ? hd : angLerp(state.heading,hd,.25);
-  if(e.beta!=null) state.pitch = state.pitch + ((e.beta-90)-state.pitch)*.25;
+  if(hd!=null){
+    if(state.heading==null) state.heading=hd;
+    else{
+      const d=((hd-state.heading+540)%360)-180;
+      if(Math.abs(d)>0.25) state.heading=(state.heading+d*0.12+360)%360;
+    }
+  }
+  if(e.beta!=null) state.pitch += ((e.beta-90)-state.pitch)*0.18;
 }
 function angLerp(a,b,t){
   let d=((b-a+540)%360)-180;
@@ -815,7 +925,7 @@ function sizeAll(){
 
 function tick(){
   put('#sHdg', state.heading==null?'---°':Math.round(state.heading).toString().padStart(3,'0')+'°');
-  put('#sElev', Math.round(state.pitch)+'°');
+  put('#sElev', Math.round(viewPitch())+'°');
   const fx1=$('#sFix');
   const fixHtml = state.lat==null
     ? '<i class="dot"></i>NO FIX'
@@ -851,7 +961,7 @@ function setMode(i,animate=true){
   $('#bg').classList.toggle('live', camOn);
   $('#veil').classList.toggle('live', state.mode!==2);
   fx.classList.toggle('live', state.mode===3 && fxMode!=='off');
-  if(state.mode===3) $('#sCount').textContent=fxMode.toUpperCase();
+  if(state.mode===3) put('#sCount', fxMode.toUpperCase());
 }
 document.querySelectorAll('#modes button').forEach(b=>b.onclick=()=>{
   const i=+b.dataset.i;
@@ -890,9 +1000,10 @@ document.querySelectorAll('#optbar button').forEach(b=>b.onclick=()=>{
   b.classList.add('on'); fxMode=b.dataset.fx; avgBuf=null;
   fx.classList.toggle('live', fxMode!=='off');
   $('#bg').classList.toggle('live', fxMode==='off');
-  $('#sCount').textContent=fxMode.toUpperCase();
+  put('#sCount', fxMode.toUpperCase());
 });
 $('#gainR').oninput=e=>{ gainV=+e.target.value; $('#gainV').textContent=gainV; };
+$('#flip').onclick=()=>{ flipCamera().catch(()=>{}); };
 
 /* ============================ BOOT ============================ */
 function mark(id,ok){ const el=$(id); el.className=ok?'ok':'no'; el.querySelector('b').textContent=ok?'OK':'OFF'; }
@@ -913,17 +1024,17 @@ $('#go').onclick=async ()=>{
   }
   mark('#cS',mo);
 
-  let cm=false;
-  try{
-    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},
-      width:{ideal:1280},height:{ideal:720}},audio:false});
-    cam.srcObject=s; await cam.play(); cm=true;
-  }catch(e){ cm=false; }
-  mark('#cC',cm);
-
-  let mic=false;
-  try{ await startAudio(); mic=true; }catch(e){ mic=false; }
-  mark('#cM',mic);
+  let cm=false, mic=false;
+  try{ await initAV(); cm=true; mic=micReady; }
+  catch(e){
+    /* combined request refused; retry pieces so one denial doesn't kill both */
+    try{
+      const v=await navigator.mediaDevices.getUserMedia({video:REAR_C});
+      camStream=v; cam.srcObject=v; await cam.play(); cm=true;
+    }catch(e2){}
+    try{ await initMic(null); mic=micReady; }catch(e3){}
+  }
+  mark('#cC',cm); mark('#cM',mic);
 
   const geo=await startGeo();
   mark('#cG',geo);
@@ -937,6 +1048,9 @@ $('#go').onclick=async ()=>{
 
 window.addEventListener('resize',()=>{ if(sized){ sizeAll(); setMode(state.mode,false);} });
 window.addEventListener('orientationchange',()=>setTimeout(()=>{ sizeAll(); setMode(state.mode,false); },300));
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden) navigator.wakeLock?.request('screen').catch(()=>{});
+});
 document.addEventListener('gesturestart',e=>e.preventDefault());
 </script>
 </body>
